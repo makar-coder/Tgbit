@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 D = "━━━━━━━━━━━━━━━━"
 DB_PATH = os.getenv("TRACKING_DB_PATH", "price_tracking.db")
+PARSER_PROXY_URL = os.getenv("PARSER_PROXY_URL", "").strip()
 CHECK_INTERVAL_SECONDS = 2 * 60 * 60
 
 MAIN_TEXT = (
@@ -676,8 +677,38 @@ def extract_product_data(page_html: str, store_key: str) -> tuple[str, int]:
     return title, price
 
 
-def request_product_page(url: str) -> tuple[str, str]:
+class StoreAccessBlocked(ValueError):
+    pass
+
+
+def page_is_blocked(page_html: str) -> bool:
+    text = BeautifulSoup(page_html, "html.parser").get_text(" ", strip=True).lower()
+    markers = (
+        "access denied",
+        "captcha",
+        "проверка, что вы не робот",
+        "подтвердите, что вы не робот",
+        "доступ ограничен",
+        "похоже, нет соединения",
+        "выключите vpn",
+        "инцидент:",
+        "abt-challenge",
+    )
+    return any(marker in text or marker in page_html.lower() for marker in markers)
+
+
+def request_product_page(url: str, store_key: str) -> tuple[str, str]:
     last_error: Exception | None = None
+    proxies = (
+        {"http": PARSER_PROXY_URL, "https": PARSER_PROXY_URL}
+        if PARSER_PROXY_URL
+        else None
+    )
+
+    if store_key == "ozon" and not PARSER_PROXY_URL:
+        logger.warning(
+            "PARSER_PROXY_URL не задан. Ozon обычно блокирует IP облачных серверов."
+        )
 
     if browser_requests is not None:
         for browser in ("chrome", "chrome124", "safari17_0"):
@@ -685,14 +716,17 @@ def request_product_page(url: str) -> tuple[str, str]:
                 response = browser_requests.get(
                     url,
                     headers=REQUEST_HEADERS,
-                    cookies={
-                        "adult": "1",
-                        "__Secure-access-token": "",
-                    },
-                    timeout=30,
+                    cookies={"adult": "1"},
+                    proxies=proxies,
+                    timeout=35,
                     allow_redirects=True,
                     impersonate=browser,
                 )
+                if page_is_blocked(response.text):
+                    last_error = StoreAccessBlocked(
+                        "Магазин заблокировал IP сервера Railway."
+                    )
+                    continue
                 if response.status_code < 400 and len(response.text) >= 1000:
                     return str(response.url), response.text
                 last_error = ValueError(
@@ -705,17 +739,26 @@ def request_product_page(url: str) -> tuple[str, str]:
     session.headers.update(REQUEST_HEADERS)
     session.cookies.update({"adult": "1"})
     try:
-        response = session.get(url, timeout=(10, 30), allow_redirects=True)
+        response = session.get(
+            url,
+            proxies=proxies,
+            timeout=(10, 35),
+            allow_redirects=True,
+        )
+        if page_is_blocked(response.text):
+            raise StoreAccessBlocked("Магазин заблокировал IP сервера Railway.")
         response.raise_for_status()
         return response.url, response.text
     except Exception as error:
         last_error = error
 
+    if isinstance(last_error, StoreAccessBlocked):
+        raise last_error
     raise ValueError(f"Не удалось загрузить страницу магазина: {last_error}")
 
 
 def fetch_product(url: str, store_key: str) -> tuple[str, int]:
-    final_url, page_html = request_product_page(url)
+    final_url, page_html = request_product_page(url, store_key)
 
     if not is_valid_store_url(final_url, store_key):
         raise ValueError("Магазин перенаправил ссылку на другой сайт.")
@@ -961,6 +1004,19 @@ async def handle_tracking_link(
     wait_message = await update.message.reply_text("⏳ Получаю название и цену товара…")
     try:
         title, price = await asyncio.to_thread(fetch_product, url, store_key)
+    except StoreAccessBlocked as error:
+        logger.warning("Магазин заблокировал запрос %s: %s", url, error)
+        await wait_message.edit_text(
+            text=(
+                f"⚠️ <b>Ozon заблокировал подключение сервера.</b>\n\n"
+                f"Ссылка правильная, но Ozon не показывает карточку товара "
+                f"серверу Railway. Для Ozon требуется российский "
+                f"резидентский прокси в переменной PARSER_PROXY_URL."
+            ),
+            parse_mode="HTML",
+            reply_markup=build_cancel_tracking_keyboard(),
+        )
+        return
     except requests.Timeout:
         await wait_message.edit_text(
             text=(
