@@ -11,6 +11,11 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from curl_cffi import requests as browser_requests
+except ImportError:
+    browser_requests = None
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -29,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 D = "━━━━━━━━━━━━━━━━"
 DB_PATH = os.getenv("TRACKING_DB_PATH", "price_tracking.db")
-CHECK_INTERVAL_SECONDS = 6 * 60 * 60
+CHECK_INTERVAL_SECONDS = 2 * 60 * 60
 
 MAIN_TEXT = (
     f"💎 **Добро пожаловать!**\n\n"
@@ -162,7 +167,11 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_database() -> None:
+    database_directory = os.path.dirname(os.path.abspath(DB_PATH))
+    os.makedirs(database_directory, exist_ok=True)
     with get_connection() as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS price_trackings (
@@ -437,6 +446,7 @@ def iter_json_objects(value: Any):
 
 
 def extract_json_ld_product(soup: BeautifulSoup) -> tuple[str | None, int | None]:
+    found_title: str | None = None
     for script in soup.select('script[type="application/ld+json"]'):
         raw = script.string or script.get_text(strip=True)
         if not raw:
@@ -453,6 +463,7 @@ def extract_json_ld_product(soup: BeautifulSoup) -> tuple[str | None, int | None
                 continue
 
             title = clean_title(item.get("name"))
+            found_title = found_title or title
             offers = item.get("offers")
             offer_items = offers if isinstance(offers, list) else [offers]
             for offer in offer_items:
@@ -465,7 +476,7 @@ def extract_json_ld_product(soup: BeautifulSoup) -> tuple[str | None, int | None
                 )
                 if title and price:
                     return title, price
-    return None, None
+    return found_title, None
 
 
 def first_meta_content(soup: BeautifulSoup, selectors: list[str]) -> str | None:
@@ -486,14 +497,85 @@ def first_text(soup: BeautifulSoup, selectors: list[str]) -> str | None:
     return None
 
 
+def extract_ruble_price(text: str | None) -> int | None:
+    if not text:
+        return None
+    normalized = html.unescape(text).replace("\xa0", " ")
+    patterns = (
+        r"(?:от\s*)?(\d{1,3}(?:[\s\u202f]\d{3})+|\d{2,9})(?:[,.]\d{1,2})?\s*(?:₽|руб(?:\.|лей|ля)?)",
+        r"(?:₽|руб(?:\.|лей|ля)?)\s*(\d{1,3}(?:[\s\u202f]\d{3})+|\d{2,9})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            price = parse_price_value(match.group(1))
+            if price:
+                return price
+    return None
+
+
+def extract_embedded_value(page_html: str, keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        patterns = (
+            rf'"{re.escape(key)}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            rf'\\"{re.escape(key)}\\"\s*:\s*\\"(.*?)(?<!\\)\\"',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, page_html, flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            value = match.group(1)
+            try:
+                value = json.loads(f'"{value}"')
+            except (json.JSONDecodeError, TypeError):
+                value = value.replace("\\u0026", "&").replace("\\/", "/")
+            value = clean_title(html.unescape(value))
+            if value:
+                return value
+    return None
+
+
+def extract_embedded_price(page_html: str, keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        patterns = (
+            rf'"{re.escape(key)}"\s*:\s*"?([^",}}]{{1,40}})"?',
+            rf'\\"{re.escape(key)}\\"\s*:\s*\\"([^\\"]{{1,40}})',
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, page_html, flags=re.IGNORECASE):
+                raw = html.unescape(match.group(1)).replace("\\u00a0", " ")
+                price = extract_ruble_price(raw) or parse_price_value(raw)
+                if price and 1 <= price <= 1_000_000_000:
+                    return price
+    return None
+
+
 def extract_product_data(page_html: str, store_key: str) -> tuple[str, int]:
     soup = BeautifulSoup(page_html, "html.parser")
+    visible_text = soup.get_text(" ", strip=True).lower()
+    blocked_markers = (
+        "access denied",
+        "captcha",
+        "проверка, что вы не робот",
+        "подтвердите, что вы не робот",
+        "доступ ограничен",
+    )
+    if len(page_html) < 1000 or any(marker in visible_text for marker in blocked_markers):
+        raise ValueError("Магазин включил защиту от автоматических запросов.")
 
     title, price = extract_json_ld_product(soup)
 
+    title_selectors = {
+        "ozon": ['[data-widget="webProductHeading"] h1', "h1"],
+        "wildberries": ["h1.product-page__title", "h1"],
+        "yandex_market": ['[data-auto="productCardTitle"]', "h1"],
+        "dns": ["h1.product-card-top__title", "h1"],
+        "mvideo": ["h1.title", "h1"],
+    }
     if not title:
         title = clean_title(
-            first_meta_content(
+            first_text(soup, title_selectors.get(store_key, ["h1"]))
+            or first_meta_content(
                 soup,
                 [
                     'meta[property="og:title"]',
@@ -501,29 +583,33 @@ def extract_product_data(page_html: str, store_key: str) -> tuple[str, int]:
                     'meta[itemprop="name"]',
                 ],
             )
-            or first_text(soup, ["h1"])
         )
 
     price_selectors = {
         "ozon": [
-            '[data-widget="webPrice"] span',
-            '[data-widget="webSale"] span',
+            '[data-widget="webPrice"]',
+            '[data-widget="webSale"]',
+            '[data-widget="webCurrentSeller"]',
         ],
         "wildberries": [
             "ins.price-block__final-price",
             ".price-block__final-price",
+            ".price-block__wallet-price",
         ],
         "yandex_market": [
             '[data-auto="snippet-price-current"]',
             '[data-auto="price-value"]',
+            '[data-auto="mainPrice"]',
         ],
         "dns": [
             ".product-buy__price",
             ".product-card-top__price-current",
+            "[data-commerce-target=price]",
         ],
         "mvideo": [
             ".price__main-value",
             ".product-price__sum-rubles",
+            "[itemprop=price]",
         ],
     }
 
@@ -540,41 +626,101 @@ def extract_product_data(page_html: str, store_key: str) -> tuple[str, int]:
         )
 
     if not price:
-        price = parse_price_value(
-            first_text(soup, price_selectors.get(store_key, []))
-        )
+        for selector in price_selectors.get(store_key, []):
+            value = first_text(soup, [selector])
+            price = extract_ruble_price(value) or (
+                parse_price_value(value) if value and len(value) < 50 else None
+            )
+            if price:
+                break
 
+    embedded_title_keys = {
+        "ozon": ("title", "productName", "name"),
+        "wildberries": ("name", "imt_name", "goodsName"),
+        "yandex_market": ("title", "productName", "name"),
+        "dns": ("name", "productName", "title"),
+        "mvideo": ("name", "productName", "title"),
+    }
+    embedded_price_keys = {
+        "ozon": (
+            "cardPrice",
+            "priceWithCard",
+            "finalPrice",
+            "salePrice",
+            "currentPrice",
+            "price",
+        ),
+        "wildberries": ("salePriceU", "salePrice", "price", "basicPriceU"),
+        "yandex_market": ("currentPrice", "value", "price"),
+        "dns": ("currentPrice", "finalPrice", "price"),
+        "mvideo": ("salePrice", "currentPrice", "price"),
+    }
+
+    if not title:
+        title = extract_embedded_value(page_html, embedded_title_keys[store_key])
     if not price:
-        patterns = [
-            r'"(?:finalPrice|salePrice|currentPrice|price)"\s*:\s*"?(\d{1,9}(?:[.,]\d{1,2})?)"?',
-            r'"price"\s*:\s*\{[^{}]{0,500}?"value"\s*:\s*"?(\d{1,9}(?:[.,]\d{1,2})?)"?',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, page_html, flags=re.IGNORECASE)
-            if match:
-                price = parse_price_value(match.group(1))
-                if price:
-                    break
+        price = extract_embedded_price(page_html, embedded_price_keys[store_key])
+        if store_key == "wildberries" and price and price > 10_000_000:
+            price //= 100
 
     if not title or not price:
-        raise ValueError("Не удалось получить название или цену товара.")
+        logger.warning(
+            "Парсер не нашёл данные: store=%s html_size=%s title=%s price=%s",
+            store_key,
+            len(page_html),
+            bool(title),
+            price,
+        )
+        raise ValueError("Не удалось получить название или текущую цену товара.")
 
     return title, price
 
 
-def fetch_product(url: str, store_key: str) -> tuple[str, int]:
-    response = requests.get(
-        url,
-        headers=REQUEST_HEADERS,
-        timeout=(10, 25),
-        allow_redirects=True,
-    )
-    response.raise_for_status()
+def request_product_page(url: str) -> tuple[str, str]:
+    last_error: Exception | None = None
 
-    if not is_valid_store_url(response.url, store_key):
+    if browser_requests is not None:
+        for browser in ("chrome", "chrome124", "safari17_0"):
+            try:
+                response = browser_requests.get(
+                    url,
+                    headers=REQUEST_HEADERS,
+                    cookies={
+                        "adult": "1",
+                        "__Secure-access-token": "",
+                    },
+                    timeout=30,
+                    allow_redirects=True,
+                    impersonate=browser,
+                )
+                if response.status_code < 400 and len(response.text) >= 1000:
+                    return str(response.url), response.text
+                last_error = ValueError(
+                    f"HTTP {response.status_code}, размер {len(response.text)}"
+                )
+            except Exception as error:
+                last_error = error
+
+    session = requests.Session()
+    session.headers.update(REQUEST_HEADERS)
+    session.cookies.update({"adult": "1"})
+    try:
+        response = session.get(url, timeout=(10, 30), allow_redirects=True)
+        response.raise_for_status()
+        return response.url, response.text
+    except Exception as error:
+        last_error = error
+
+    raise ValueError(f"Не удалось загрузить страницу магазина: {last_error}")
+
+
+def fetch_product(url: str, store_key: str) -> tuple[str, int]:
+    final_url, page_html = request_product_page(url)
+
+    if not is_valid_store_url(final_url, store_key):
         raise ValueError("Магазин перенаправил ссылку на другой сайт.")
 
-    return extract_product_data(response.text, store_key)
+    return extract_product_data(page_html, store_key)
 
 
 def format_price(price: int) -> str:
@@ -937,16 +1083,18 @@ def main() -> None:
     )
     app.add_error_handler(handle_error)
 
-    if app.job_queue is None:
-        raise RuntimeError(
-            "JobQueue недоступен. Установите python-telegram-bot[job-queue]."
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            check_all_prices,
+            interval=CHECK_INTERVAL_SECONDS,
+            first=60,
+            name="price_check_every_2_hours",
         )
-    app.job_queue.run_repeating(
-        check_all_prices,
-        interval=CHECK_INTERVAL_SECONDS,
-        first=CHECK_INTERVAL_SECONDS,
-        name="price_check_every_6_hours",
-    )
+    else:
+        logger.error(
+            "JobQueue недоступен: автоматическая проверка цен отключена, "
+            "но бот продолжит работать."
+        )
 
     logger.info("Бот запущен. Long polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
